@@ -91,11 +91,47 @@ class HybridRetriever:
             scores[i] = scores.get(i, 0.0) + 1.0 / (rrf_k + rank)
             sources.setdefault(i, []).append("vector")
 
-        ranked = sorted(scores.items(), key=lambda kv: -kv[1])
+        # Apply query-aware score adjustments BEFORE ranking
+        adjusted_scores = {}
+
+        DISRUPTION_KEYWORDS = ["delay", "rain", "snow", "storm"]
+
+        for i, score in scores.items():
+            doc = self.docs[i]
+
+            # Boost alerts and priortize delay-specific alerts; penalize non-delay alerts
+            if any(k in query.lower() for k in DISRUPTION_KEYWORDS):
+                if doc.type == "alert":
+                    score += 0.02
+
+                    # Extra boost for specific delay alerts
+                    if any(k in doc.id for k in ["signal", "delay", "rain", "snow"]):
+                        score += 0.03
+                    else:
+                        score -= 0.01 # Penalize alerts not about delay (e.g. snow)
+
+                elif doc.type == "stop":
+                    score -= 0.01
+                
+            # Boost shuttle-related results for shuttle queries
+            if "shuttle" in query.lower():
+                if doc.type in ["shuttle_schedule", "alert"]:
+                    score += 0.02
+
+            # Penalize generic alerts for shuttle queries
+            if "shuttle" in query.lower():
+                if doc.type == "alert":
+                    if not any(k in doc.id for k in ["shuttle", "delay", "signal"]):
+                        score -= 0.02
+            
+            adjusted_scores[i] = score
+
+        ranked = sorted(adjusted_scores.items(), key=lambda kv: -kv[1])
 
         results: list[RetrievedDoc] = []
         for i, score in ranked:
             doc = self.docs[i]
+
             if type_filter and doc.type not in type_filter:
                 continue
             if route_filter:
