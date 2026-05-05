@@ -1,16 +1,44 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
 .env
+.env.local
 .venv/
 venv/
 .pytest_cache/
 .ipynb_checkpoints/
 
-# Generated indices & caches
+# Generated artefacts
 data/index/
 data/cache/
 data/results/
 
-# Streamlit
+# Streamlit (legacy)
 .streamlit/secrets.toml
+
+# Node / Expo (frontend)
+frontend/node_modules/
+frontend/.expo/
+frontend/.expo-shared/
+frontend/dist/
+frontend/web-build/
+frontend/.metro-cache/
+frontend/.chrome-profile/
+
+# Build / IDE
+.DS_Store
+.vscode/
+.idea/
+Thumbs.db
+
+# Presentation artefacts (not committed)
+*.pptx
+~$*.pptx
+build_pptx.py
+
+# Debug residue
+debug_browser.js
+debug_screenshot.png
+.chrome-profile/
+_scan_zh.py

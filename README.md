@@ -1,178 +1,159 @@
 # OnTime+ — A Schedule-Aware Transit Assistant
 
-RAG-based chatbot that answers "**will I arrive on time, and what is the safest way?**"
+RAG-based chatbot that answers **"will I arrive on time, and what is the safest way?"**
 for UMass Boston students using MBTA + UMB shuttle.
 
-It combines:
-
-- **Hybrid retrieval** (BM25 + OpenAI dense embeddings + RRF fusion) over a
-  curated MBTA / UMB-shuttle / simulated-disruption knowledge base.
-- **LLM intent extraction** that turns free-form questions into a typed
-  `TimeConstraint` (origin, destination, deadline, depart_time, high_stakes).
-- **Rule-based, evidence-grounded route estimator** that uses metadata
-  (median, std, peak/off-peak, alerts) instead of letting the LLM hallucinate
-  numbers.
-- **Risk labeller** (`reliable` / `caution` / `risky`) computed from buffer
-  vs. travel-time variance and active alerts.
-- **FastAPI backend + Streamlit web UI**, wired so a future mobile app can
-  use the exact same `/chat` endpoint.
+This `demo` branch contains the **integrated demo build** — backend + mobile
+frontend in one repo, both verified end-to-end on 2026-05-05.
 
 ---
 
-## 1. Project layout
+## What's in here
 
 ```
-ontime_plus/
-├── config.py                # Pydantic settings (.env aware)
-├── schemas.py               # Typed contracts shared across nodes / API / UI
-├── data/
-│   ├── raw/                 # MBTA routes, stops, UMB shuttle (real subset)
-│   ├── simulated/           # Travel times, disruption scenarios, policy
-│   └── index/               # FAISS + BM25 + docs.json (built on demand)
-├── ingest/
-│   ├── loader.py            # JSONL -> KBDoc
-│   ├── chunker.py           # Long-doc chunker (pass-through by default)
-│   ├── embedder.py          # OpenAI text-embedding-3-small wrapper
-│   └── build_index.py       # CLI: build FAISS + BM25 indices
-├── retriever/
-│   └── hybrid.py            # BM25 + vector + RRF + type/route filters
-├── nodes/
-│   ├── intent_extractor.py  # LLM JSON-mode -> TimeConstraint
-│   ├── retrieve.py          # Composes a focused retrieval query
-│   ├── route_estimator.py   # Rule-based RoutePlan from evidence
-│   ├── risk_analyzer.py     # Buffer + alert -> RiskLabel
-│   └── answer_composer.py   # LLM -> grounded final answer w/ citations
-├── graph.py                 # LangGraph orchestration (intent -> answer)
-├── harness/
-│   ├── llm_client.py        # OpenAI chat / chat_json
-│   └── time_utils.py        # peak windows, hh:mm parsing, add/sub minutes
-├── prompts/templates.py     # All prompts in one file
-├── app/
-│   ├── api.py               # FastAPI: /chat /health /example_queries
-│   └── streamlit_app.py     # Streamlit web UI calling the FastAPI backend
-├── eval/
-│   ├── test_queries.jsonl   # 10 labelled cases (intent + relevant docs + risk)
-│   ├── metrics.py           # Intent / Retrieval / Risk metrics
-│   └── run_eval.py          # CLI: run eval -> EVALUATION_REPORT.md
-└── tests/test_offline.py    # Pure-Python smoke tests (no API key required)
+ontime_plus/                       <-- repo root (the BACKEND lives at the root)
+├── app/api.py                     FastAPI: POST /chat, GET /health, GET /example_queries
+├── graph.py                       LangGraph orchestration (5-node pipeline)
+├── schemas.py                     Pydantic contracts shared with the frontend
+├── nodes/                         intent / retrieve / route / risk / answer
+├── retriever/hybrid.py            BM25 + dense (BGE-small) + RRF fusion
+├── ingest/                        JSONL -> KBDoc -> FAISS + BM25 index
+├── harness/                       LLM client, time utils, alert filter
+├── prompts/templates.py           Intent + answer prompts
+├── data/raw/                      MBTA routes / stops / UMB shuttle (curated subset)
+├── data/simulated/                Travel times, disruption + weather alerts, policy KB
+├── eval/                          20-query labelled set, metrics harness
+├── tests/                         Offline pytest smoke tests
+│
+├── frontend/                      <-- the FRONTEND (Expo / React Native, TypeScript)
+│   ├── App.tsx, src/, assets/, __tests__/
+│   ├── package.json, tsconfig.json, app.json
+│   ├── babel.config.js, jest.config.js
+│   ├── metro.config.js            <-- white-screen fix (zustand ESM redirect)
+│   └── FRONTEND_README.md         frontend-specific README
+│
+├── REPORT_V1.md                   Full technical report (rubric-aligned)
+├── FRONTEND_INTEGRATION.md        How the frontend talks to the backend
+├── DEMO_SPEECH.md                 Verbatim live demo speech
+└── OnTimePlus_Proposal.pdf        Original project proposal
 ```
 
-## 2. Quick start
+---
+
+## Quick start
+
+### Backend (one terminal)
 
 ```powershell
-# 1) Install dependencies
-cd C:\
-pip install -r ontime_plus\requirements.txt
+# 1) Install deps
+pip install -r requirements.txt
 
-# 2) Configure secrets
-copy ontime_plus\.env.example ontime_plus\.env
-# then edit ontime_plus\.env and put your OPENAI_API_KEY
+# 2) Configure secrets (one-time)
+copy .env.example .env
+# then edit .env and put your OPENAI_API_KEY
 
-# 3) Build the index (FAISS + BM25)
+# 3) Build the index (FAISS + BM25, ~30 s for 48 docs)
 python -m ontime_plus.ingest.build_index
 
-# 4) Run offline tests (no API key needed)
-pytest ontime_plus\tests -v
+# 4) Run offline smoke tests (no API key needed)
+pytest tests -v
 
-# 5) Start the API backend
+# 5) Start the FastAPI backend
 uvicorn ontime_plus.app.api:app --port 8000
-
-# 6) In another terminal, start the web UI
-streamlit run ontime_plus\app\streamlit_app.py
+# Health check: http://127.0.0.1:8000/health
+# OpenAPI docs: http://127.0.0.1:8000/docs
 ```
 
-The Streamlit app talks to the FastAPI backend at `http://127.0.0.1:8000`
-through the same JSON contract a future mobile app would use, so you can
-swap front-ends without touching the agent code.
-
-## 3. Architecture
-
-```
-User Query (+ optional schedule)
-        │
-        ▼
-[1] Intent Extraction (LLM, JSON-mode)
-        │  TimeConstraint{origin, destination, deadline, depart_time, high_stakes}
-        ▼
-[2] Hybrid Retrieval (BM25 + vector + RRF)
-        │  list[RetrievedDoc] from KB (routes, stops, shuttle, travel times,
-        │                              alerts, policy)
-        ▼
-[3] Route Estimation (rule-based, evidence-grounded)
-        │  RoutePlan{segments, total_expected_min, total_std_min, alert_added_min}
-        ▼
-[4] Risk Analysis
-        │  RiskAnalysis{label ∈ reliable/caution/risky, buffer_min, sigma_used}
-        │  + suggested_depart_time
-        ▼
-[5] Answer Composition (LLM, constrained to use evidence + structured plan)
-        │
-        ▼
-Final Answer (recommendation + risk label + citations to doc IDs)
-```
-
-The graph is built with **LangGraph** so every step's input and output is
-inspectable (the Streamlit UI exposes intent / plan / risk / evidence panels
-for transparency, which is also useful when grading or demoing).
-
-## 4. Knowledge base
-
-The KB is a set of **JSONL files** with a uniform schema (see `schemas.py::KBDoc`):
-
-| Type                | Source            | Examples                                   |
-|---------------------|-------------------|--------------------------------------------|
-| `route_overview`    | MBTA GTFS subset  | Red Line, Green B/C/D/E, Orange, Blue, SL1 |
-| `stop`              | MBTA GTFS subset  | JFK/UMass, Park Street, South Station ...  |
-| `shuttle_schedule`  | UMB Transportation| JFK/UMass <-> Campus Center shuttle        |
-| `travel_time`       | Simulated         | median + std for peak / off-peak           |
-| `alert`             | Simulated         | Red Line signal, Green Line disabled, etc. |
-| `policy`            | OnTime+ rules     | buffer policy, risk labelling thresholds   |
-
-To extend: just drop another JSONL into `data/raw/` or `data/simulated/`,
-keep IDs unique, and rerun `python -m ontime_plus.ingest.build_index`.
-
-## 5. Evaluation
+### Frontend (second terminal)
 
 ```powershell
-python -m ontime_plus.eval.run_eval
+cd frontend
+npm install                            # one-time
+
+$env:EXPO_PUBLIC_USE_MOCKS = "false"   # talk to real backend, not mocks
+$env:EXPO_PUBLIC_API_BASE  = "http://127.0.0.1:8000"
+npx expo start --web --port 19006
+# Web app: http://localhost:19006
 ```
 
-This produces three families of metrics on `eval/test_queries.jsonl`:
+For iOS/Android via Expo Go: `npx expo start --lan` and scan the QR. Set
+`EXPO_PUBLIC_API_BASE` to your machine's LAN IP so the phone can reach
+the backend.
 
-1. **Intent extraction** — exact match + per-slot accuracy for
-   `origin`, `destination`, `deadline`, `depart_time`, `high_stakes`.
-2. **Retrieval** — Recall@k, Precision@k (k=3,5,10), MRR.
-3. **Risk labelling** — accuracy, macro-F1, per-class F1, full
-   confusion matrix.
+### Run the evaluation harness
 
-Outputs land in `data/results/`:
+```powershell
+python -m ontime_plus.eval.run_eval --test eval/test_queries_v2.jsonl --suffix v3
+# Outputs land in data/results/:
+#   eval_predictions_v3.jsonl  (per-query trace)
+#   eval_metrics_v3.json       (aggregate numbers)
+#   EVALUATION_REPORT_v3.md    (human summary)
+```
 
-- `eval_predictions.jsonl` — one row per test query
-- `eval_metrics.json` — all aggregate numbers
-- `EVALUATION_REPORT.md` — human-readable summary
+---
 
-The labelled test set is small but covers all four example queries from the
-proposal plus six additional cases (high-stakes, active alert, weather,
-shuttle reduction, etc.). Add more queries to `eval/test_queries.jsonl` as
-the system matures.
+## Architecture (one diagram)
 
-## 6. Path to a mobile app
+```
+   User Query (+ optional schedule)
+              |
+              v
+   [1] Intent Extraction       <-- LLM, JSON-mode
+              |  TimeConstraint{origin, destination, deadline, depart_time, high_stakes}
+              v
+   [2] Hybrid Retrieval        <-- BM25 + BGE + RRF + targeted alert pass
+              |  list[RetrievedDoc]
+              v
+   [3] Route Estimation        <-- rule-based (NOT the LLM)
+              |  RoutePlan{segments, total_min, std_min, alert_added_min}
+              v
+   [4] Risk Analysis           <-- rule-based, two-mode buffer policy
+              |  RiskAnalysis{label in reliable/caution/risky, buffer_min, suggested_depart}
+              v
+   [5] Answer Composition      <-- LLM, constrained to use evidence + structured plan
+              |
+              v
+   Final Answer (recommendation + risk label + citations to doc IDs)
+```
 
-The split between FastAPI (`app/api.py`) and Streamlit (`app/streamlit_app.py`)
-is deliberate:
+**Design discipline:** the LLM is used at only two points — converting
+free-form text into typed JSON (Node 1) and verbalising a structured
+plan (Node 5). Numerical decisions and risk labels are computed by
+deterministic Python so every answer is auditable.
 
-- The Streamlit app **does not** import any agent code; it only does
-  `requests.post("/chat", ...)`.
-- A future mobile (React Native / Flutter) client uses the same JSON
-  contract — `ChatRequest` in, `ChatResponse` out.
-- All schemas are Pydantic models so the API generates an OpenAPI spec
-  automatically at `http://127.0.0.1:8000/docs`, which most mobile codegen
-  tools can consume directly.
+---
 
-## 7. Roadmap
+## Knowledge base summary (48 docs, JSONL)
 
-- Real-time MBTA Alerts API integration (replace simulated alerts).
-- LLM-as-judge for end-to-end answer quality.
-- Multi-turn dialog (the user clarifying origin / preferences).
-- Push notifications in the mobile app when an active alert affects a saved
-  recurring trip ("class at 10 AM, MWF").
+| Type               | n  | Source                       | Examples                                  |
+|--------------------|----|------------------------------|-------------------------------------------|
+| `route_overview`   | 9  | MBTA GTFS subset             | Red, Orange, Blue, Green B/C/D/E, SL1     |
+| `stop`             | 10 | MBTA GTFS subset             | Alewife, Park St, JFK/UMass, ...          |
+| `shuttle_schedule` | 2  | UMass Boston Transportation  | JFK/UMass <-> Campus Center               |
+| `travel_time`      | 11 | Simulated (median + std)     | Per-segment peak / off-peak distributions |
+| `alert`            | 13 | Simulated MBTA / UMB alerts  | Signal failures, weather, holiday service |
+| `policy`           | 3  | OnTime+ rules                | Buffer policy, risk thresholds, peak hrs  |
+
+To extend, drop another JSONL into `data/raw/` or `data/simulated/`
+with a unique `id` and rerun `python -m ontime_plus.ingest.build_index`.
+
+---
+
+## Documents
+
+- [REPORT_V1.md](REPORT_V1.md) — full technical report with evaluation
+- [FRONTEND_INTEGRATION.md](FRONTEND_INTEGRATION.md) — frontend/backend integration runbook
+- [DEMO_SPEECH.md](DEMO_SPEECH.md) — verbatim live demo speech (~3 min 30 s)
+- [OnTimePlus_Proposal.pdf](OnTimePlus_Proposal.pdf) — original project proposal
+
+---
+
+## Branch context
+
+This is the `demo` branch — an integration cut combining:
+
+- the backend RAG pipeline from `embeddings`
+- the mobile chatbot UI from `chatbot-interface`
+
+Both contributing branches remain untouched. See [FRONTEND_INTEGRATION.md](FRONTEND_INTEGRATION.md)
+for the verified API contract match between the two.

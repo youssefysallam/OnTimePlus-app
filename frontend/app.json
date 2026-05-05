@@ -1,0 +1,27 @@
+{
+  "expo": {
+    "name": "OnTime+",
+    "slug": "ontimeplus",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "ontimeplus",
+    "userInterfaceStyle": "dark",
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": false
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#1C1C1E"
+      }
+    },
+    "web": {
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-asset"
+    ]
+  }
+}
