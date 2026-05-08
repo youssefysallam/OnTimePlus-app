@@ -1,159 +1,130 @@
-# OnTime+ — A Schedule-Aware Transit Assistant
+# OnTime+
 
-RAG-based chatbot that answers **"will I arrive on time, and what is the safest way?"**
-for UMass Boston students using MBTA + UMB shuttle.
-
-This `demo` branch contains the **integrated demo build** — backend + mobile
-frontend in one repo, both verified end-to-end on 2026-05-05.
+A schedule-aware transit assistant for UMass Boston students. Ask it in plain English — "Will I make it to my 10 AM class if I leave Alewife at 9:30?" — and it answers with a risk label, a departure recommendation, and citations to the evidence it used.
 
 ---
 
-## What's in here
+## How it works
 
 ```
-ontime_plus/                       <-- repo root (the BACKEND lives at the root)
-├── app/api.py                     FastAPI: POST /chat, GET /health, GET /example_queries
-├── graph.py                       LangGraph orchestration (5-node pipeline)
-├── schemas.py                     Pydantic contracts shared with the frontend
-├── nodes/                         intent / retrieve / route / risk / answer
-├── retriever/hybrid.py            BM25 + dense (BGE-small) + RRF fusion
-├── ingest/                        JSONL -> KBDoc -> FAISS + BM25 index
-├── harness/                       LLM client, time utils, alert filter
-├── prompts/templates.py           Intent + answer prompts
-├── data/raw/                      MBTA routes / stops / UMB shuttle (curated subset)
-├── data/simulated/                Travel times, disruption + weather alerts, policy KB
-├── eval/                          20-query labelled set, metrics harness
-├── tests/                         Offline pytest smoke tests
-│
-├── frontend/                      <-- the FRONTEND (Expo / React Native, TypeScript)
-│   ├── App.tsx, src/, assets/, __tests__/
-│   ├── package.json, tsconfig.json, app.json
-│   ├── babel.config.js, jest.config.js
-│   ├── metro.config.js            <-- white-screen fix (zustand ESM redirect)
-│   └── FRONTEND_README.md         frontend-specific README
-│
-├── REPORT_V1.md                   Full technical report (rubric-aligned)
-├── FRONTEND_INTEGRATION.md        How the frontend talks to the backend
-├── DEMO_SPEECH.md                 Verbatim live demo speech
-└── OnTimePlus_Proposal.pdf        Original project proposal
+User query (+ optional schedule)
+         │
+         ▼
+[1] Intent Extraction     ← LLM, JSON-mode → TimeConstraint{origin, dest, deadline, …}
+         │
+         ▼
+[2] Hybrid Retrieval      ← BM25 + BGE-small-en + Reciprocal Rank Fusion
+         │                   + targeted MBTA alert pass
+         │  list[RetrievedDoc]
+         ▼
+[3] Route Estimation      ← deterministic rule-based (NOT the LLM)
+         │  RoutePlan{segments, total_min, std_min, alert_added_min}
+         ▼
+[4] Risk Analysis         ← deterministic two-mode buffer policy
+         │  RiskAnalysis{reliable | caution | risky, buffer_min, suggested_depart}
+         ▼
+[5] Answer Composition    ← LLM, constrained to structured plan + citations
+         │
+         ▼
+Final answer + risk label + doc citations
+```
+
+**Design discipline:** the LLM touches only nodes 1 and 5. Numerical decisions and risk labels come from deterministic Python so every answer is auditable and reproducible.
+
+---
+
+## Key Features
+
+- **Hybrid retrieval** — BM25 sparse + BGE-small dense embeddings fused with Reciprocal Rank Fusion for high-recall document retrieval
+- **Risk-aware answers** — three-tier risk model (reliable / caution / risky) with computed departure buffers based on historical travel-time variance
+- **MBTA alert awareness** — live alert docs in the knowledge base automatically add delay minutes to route estimates
+- **Response caching** — 5-minute MD5-keyed cache on `/chat` cuts repeat-query latency to zero
+- **Timeout protection** — 30-second thread-pool timeout returns HTTP 504 instead of hanging indefinitely
+- **Mobile frontend** — Expo React Native chatbot UI with streaming typing indicator
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Backend | FastAPI + LangGraph (5-node pipeline) |
+| Retrieval | BM25 + BGE-small-en + FAISS (Reciprocal Rank Fusion) |
+| LLM | OpenAI-compatible (configurable model/base URL) |
+| Schema | Pydantic v2 |
+| Frontend | Expo (React Native + TypeScript) |
+| Language | Python 3.11+ |
+
+---
+
+## Project Structure
+
+```
+ontime_plus/
+  app/api.py          FastAPI: /chat (cached), /health, /example_queries
+  graph.py            LangGraph 5-node orchestration
+  nodes/              intent / retrieve / route / risk / answer
+  retriever/hybrid.py BM25 + BGE + RRF fusion
+  ingest/             JSONL → KBDoc → FAISS + BM25 index
+  data/raw/           MBTA routes, stops, UMB shuttle (48 docs)
+  data/simulated/     Travel times, alerts, policy KB
+tests/
+  test_retrieval.py   Offline pytest smoke tests (no API key needed)
+frontend/
+  App.tsx, src/       Expo React Native chatbot UI
 ```
 
 ---
 
-## Quick start
+## Quick Start
 
-### Backend (one terminal)
+### Backend
 
-```powershell
-# 1) Install deps
-pip install -r requirements.txt
+```bash
+pip install -e .
 
-# 2) Configure secrets (one-time)
-copy .env.example .env
-# then edit .env and put your OPENAI_API_KEY
+cp .env.example .env        # add your OPENAI_API_KEY
 
-# 3) Build the index (FAISS + BM25, ~30 s for 48 docs)
+# Build the FAISS + BM25 index (~30s for 48 docs)
 python -m ontime_plus.ingest.build_index
 
-# 4) Run offline smoke tests (no API key needed)
-pytest tests -v
+# Smoke tests (no API key needed)
+pytest tests/ -v
 
-# 5) Start the FastAPI backend
+# Start the API
 uvicorn ontime_plus.app.api:app --port 8000
-# Health check: http://127.0.0.1:8000/health
-# OpenAPI docs: http://127.0.0.1:8000/docs
+# → http://localhost:8000/docs
 ```
 
-### Frontend (second terminal)
+### Frontend
 
-```powershell
+```bash
 cd frontend
-npm install                            # one-time
+npm install
 
-$env:EXPO_PUBLIC_USE_MOCKS = "false"   # talk to real backend, not mocks
-$env:EXPO_PUBLIC_API_BASE  = "http://127.0.0.1:8000"
-npx expo start --web --port 19006
-# Web app: http://localhost:19006
-```
-
-For iOS/Android via Expo Go: `npx expo start --lan` and scan the QR. Set
-`EXPO_PUBLIC_API_BASE` to your machine's LAN IP so the phone can reach
-the backend.
-
-### Run the evaluation harness
-
-```powershell
-python -m ontime_plus.eval.run_eval --test eval/test_queries_v2.jsonl --suffix v3
-# Outputs land in data/results/:
-#   eval_predictions_v3.jsonl  (per-query trace)
-#   eval_metrics_v3.json       (aggregate numbers)
-#   EVALUATION_REPORT_v3.md    (human summary)
+EXPO_PUBLIC_API_BASE=http://127.0.0.1:8000 npx expo start --web
 ```
 
 ---
 
-## Architecture (one diagram)
+## Knowledge Base
 
-```
-   User Query (+ optional schedule)
-              |
-              v
-   [1] Intent Extraction       <-- LLM, JSON-mode
-              |  TimeConstraint{origin, destination, deadline, depart_time, high_stakes}
-              v
-   [2] Hybrid Retrieval        <-- BM25 + BGE + RRF + targeted alert pass
-              |  list[RetrievedDoc]
-              v
-   [3] Route Estimation        <-- rule-based (NOT the LLM)
-              |  RoutePlan{segments, total_min, std_min, alert_added_min}
-              v
-   [4] Risk Analysis           <-- rule-based, two-mode buffer policy
-              |  RiskAnalysis{label in reliable/caution/risky, buffer_min, suggested_depart}
-              v
-   [5] Answer Composition      <-- LLM, constrained to use evidence + structured plan
-              |
-              v
-   Final Answer (recommendation + risk label + citations to doc IDs)
-```
+| Type | Count | Source |
+|---|---|---|
+| `route_overview` | 9 | MBTA GTFS subset |
+| `stop` | 10 | MBTA GTFS subset |
+| `shuttle_schedule` | 2 | UMass Boston Transportation |
+| `travel_time` | 11 | Simulated (median + std dev) |
+| `alert` | 13 | Simulated MBTA / UMB alerts |
+| `policy` | 3 | OnTime+ buffer rules |
 
-**Design discipline:** the LLM is used at only two points — converting
-free-form text into typed JSON (Node 1) and verbalising a structured
-plan (Node 5). Numerical decisions and risk labels are computed by
-deterministic Python so every answer is auditable.
+To add documents: drop a JSONL file in `data/raw/` or `data/simulated/` and rerun `build_index`.
 
 ---
 
-## Knowledge base summary (48 docs, JSONL)
+## Example Queries
 
-| Type               | n  | Source                       | Examples                                  |
-|--------------------|----|------------------------------|-------------------------------------------|
-| `route_overview`   | 9  | MBTA GTFS subset             | Red, Orange, Blue, Green B/C/D/E, SL1     |
-| `stop`             | 10 | MBTA GTFS subset             | Alewife, Park St, JFK/UMass, ...          |
-| `shuttle_schedule` | 2  | UMass Boston Transportation  | JFK/UMass <-> Campus Center               |
-| `travel_time`      | 11 | Simulated (median + std)     | Per-segment peak / off-peak distributions |
-| `alert`            | 13 | Simulated MBTA / UMB alerts  | Signal failures, weather, holiday service |
-| `policy`           | 3  | OnTime+ rules                | Buffer policy, risk thresholds, peak hrs  |
-
-To extend, drop another JSONL into `data/raw/` or `data/simulated/`
-with a unique `id` and rerun `python -m ontime_plus.ingest.build_index`.
-
----
-
-## Documents
-
-- [REPORT_V1.md](REPORT_V1.md) — full technical report with evaluation
-- [FRONTEND_INTEGRATION.md](FRONTEND_INTEGRATION.md) — frontend/backend integration runbook
-- [DEMO_SPEECH.md](DEMO_SPEECH.md) — verbatim live demo speech (~3 min 30 s)
-- [OnTimePlus_Proposal.pdf](OnTimePlus_Proposal.pdf) — original project proposal
-
----
-
-## Branch context
-
-This is the `demo` branch — an integration cut combining:
-
-- the backend RAG pipeline from `embeddings`
-- the mobile chatbot UI from `chatbot-interface`
-
-Both contributing branches remain untouched. See [FRONTEND_INTEGRATION.md](FRONTEND_INTEGRATION.md)
-for the verified API contract match between the two.
+- *"My class starts at 10 AM at UMass Boston — when should I leave from Alewife?"*
+- *"If I leave Harvard at 9:30, will I make it to the Campus Center by 10:00?"*
+- *"The Red Line is delayed — what should I do if I have a midterm at 9:00?"*
+- *"What is the safest way to get from Quincy Center to UMB by 8:45?"*
