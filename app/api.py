@@ -11,7 +11,11 @@ Run:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -39,6 +43,23 @@ app.add_middleware(
 
 
 _agent: OnTimeAgent | None = None
+
+_CACHE_TTL = 300  # seconds
+_cache: dict[str, tuple[float, ChatResponse]] = {}
+_executor = ThreadPoolExecutor(max_workers=4)
+_CHAT_TIMEOUT = 30  # seconds
+
+
+def _cache_key(query: str, schedule: dict | None) -> str:
+    payload = json.dumps({"q": query, "s": schedule}, sort_keys=True)
+    return hashlib.md5(payload.encode()).hexdigest()
+
+
+def _evict_expired() -> None:
+    now = time.monotonic()
+    expired = [k for k, (ts, _) in _cache.items() if now - ts > _CACHE_TTL]
+    for k in expired:
+        _cache.pop(k, None)
 
 
 def _get_agent() -> OnTimeAgent:
@@ -85,12 +106,26 @@ def health() -> HealthResponse:
 def chat(req: ChatRequest) -> ChatResponse:
     if not req.query.strip():
         raise HTTPException(400, "query must be non-empty")
+
+    _evict_expired()
+    key = _cache_key(req.query, req.schedule)
+    if key in _cache:
+        _, cached = _cache[key]
+        log.debug("cache hit for query: %.60s", req.query)
+        return cached
+
     try:
         agent = _get_agent()
-        return agent.ask(req.query, req.schedule)
+        future = _executor.submit(agent.ask, req.query, req.schedule)
+        result: ChatResponse = future.result(timeout=_CHAT_TIMEOUT)
+    except FuturesTimeoutError:
+        raise HTTPException(504, "request timed out — try a shorter or simpler query")
     except Exception as e:
         log.exception("chat failed")
         raise HTTPException(500, f"chat failed: {e}") from e
+
+    _cache[key] = (time.monotonic(), result)
+    return result
 
 
 @app.get("/example_queries")
