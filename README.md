@@ -1,6 +1,6 @@
 # OnTime+
 
-A schedule-aware transit assistant for UMass Boston students. Ask it in plain English — "Will I make it to my 10 AM class if I leave Alewife at 9:30?" — and it answers with a risk label, a departure recommendation, and citations to the evidence it used.
+A schedule-aware transit assistant for UMass Boston students. Ask it in plain English, "Will I make it to my 10 AM class if I leave Alewife at 9:30?" — and it answers with a risk label, a departure recommendation, and citations to the evidence it used.
 
 ---
 
